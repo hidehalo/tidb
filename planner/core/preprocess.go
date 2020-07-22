@@ -47,6 +47,36 @@ func InTxnRetry(p *preprocessor) {
 	p.flag |= inTxnRetry
 }
 
+// TryAddExtraLimit trys to add an extra limit for SELECT or UNION statement when sql_select_limit is set.
+func TryAddExtraLimit(ctx sessionctx.Context, node ast.StmtNode) ast.StmtNode {
+	if ctx.GetSessionVars().SelectLimit == math.MaxUint64 || ctx.GetSessionVars().InRestrictedSQL {
+		return node
+	}
+	if explain, ok := node.(*ast.ExplainStmt); ok {
+		explain.Stmt = TryAddExtraLimit(ctx, explain.Stmt)
+		return explain
+	} else if sel, ok := node.(*ast.SelectStmt); ok {
+		if sel.Limit != nil || sel.SelectIntoOpt != nil {
+			return node
+		}
+		newSel := *sel
+		newSel.Limit = &ast.Limit{
+			Count: ast.NewValueExpr(ctx.GetSessionVars().SelectLimit, "", ""),
+		}
+		return &newSel
+	} else if union, ok := node.(*ast.UnionStmt); ok {
+		if union.Limit != nil {
+			return node
+		}
+		newUnion := *union
+		newUnion.Limit = &ast.Limit{
+			Count: ast.NewValueExpr(ctx.GetSessionVars().SelectLimit, "", ""),
+		}
+		return &newUnion
+	}
+	return node
+}
+
 // Preprocess resolves table names of the node, and checks some statements validation.
 func Preprocess(ctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema, preprocessOpt ...PreprocessOpt) error {
 	v := preprocessor{is: is, ctx: ctx, tableAliasInJoin: make([]map[string]interface{}, 0)}
@@ -455,6 +485,9 @@ func (p *preprocessor) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
 			}
 		}
 	}
+	if p.err = checkUnsupportedTableOptions(stmt.Options); p.err != nil {
+		return
+	}
 	if stmt.Select != nil {
 		// FIXME: a temp error noticing 'not implemented' (issue 4754)
 		p.err = errors.New("'CREATE TABLE ... SELECT' is not implemented yet")
@@ -643,6 +676,9 @@ func (p *preprocessor) checkAlterTableGrammar(stmt *ast.AlterTableStmt) {
 				return
 			}
 		}
+		if p.err = checkUnsupportedTableOptions(spec.Options); p.err != nil {
+			return
+		}
 		switch spec.Tp {
 		case ast.AlterTableAddConstraint:
 			switch spec.Constraint.Tp {
@@ -685,6 +721,19 @@ func checkIndexInfo(indexName string, IndexPartSpecifications []*ast.IndexPartSp
 		return infoschema.ErrTooManyKeyParts.GenWithStackByArgs(mysql.MaxKeyParts)
 	}
 	return checkDuplicateColumnName(IndexPartSpecifications)
+}
+
+// checkUnsupportedTableOptions checks if there exists unsupported table options
+func checkUnsupportedTableOptions(options []*ast.TableOption) error {
+	for _, option := range options {
+		switch option.Tp {
+		case ast.TableOptionUnion:
+			return ddl.ErrTableOptionUnionUnsupported
+		case ast.TableOptionInsertMethod:
+			return ddl.ErrTableOptionInsertMethodUnsupported
+		}
+	}
+	return nil
 }
 
 // checkColumn checks if the column definition is valid.

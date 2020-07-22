@@ -202,10 +202,8 @@ func (h *rpcHandler) buildTableScan(ctx *dagContext, executor *tipb.Executor) (*
 		col := columns[i]
 		colInfos[i] = rowcodec.ColInfo{
 			ID:         col.ColumnId,
-			Tp:         col.Tp,
-			Flag:       col.Flag,
+			Ft:         ctx.evalCtx.fieldTps[i],
 			IsPKHandle: col.GetPkHandle(),
-			Collate:    collate.CollationID2Name(col.Collation),
 		}
 	}
 	defVal := func(i int) ([]byte, error) {
@@ -269,10 +267,8 @@ func (h *rpcHandler) buildIndexScan(ctx *dagContext, executor *tipb.Executor) (*
 		col := columns[i]
 		colInfos = append(colInfos, rowcodec.ColInfo{
 			ID:         col.ColumnId,
-			Tp:         col.Tp,
-			Flag:       col.Flag,
+			Ft:         ctx.evalCtx.fieldTps[i],
 			IsPKHandle: col.GetPkHandle(),
-			Collate:    collate.CollationID2Name(col.Collation),
 		})
 	}
 	e := &indexScanExec{
@@ -504,6 +500,42 @@ type mockCopStreamClient struct {
 	ctx      context.Context
 	dagCtx   *dagContext
 	finished bool
+}
+
+type mockBathCopErrClient struct {
+	mockClientStream
+
+	*errorpb.Error
+}
+
+func (mock *mockBathCopErrClient) Recv() (*coprocessor.BatchResponse, error) {
+	return &coprocessor.BatchResponse{
+		OtherError: mock.Error.Message,
+	}, nil
+}
+
+type mockBatchCopDataClient struct {
+	mockClientStream
+
+	chunks []tipb.Chunk
+	idx    int
+}
+
+func (mock *mockBatchCopDataClient) Recv() (*coprocessor.BatchResponse, error) {
+	if mock.idx < len(mock.chunks) {
+		res := tipb.SelectResponse{
+			Chunks: []tipb.Chunk{mock.chunks[mock.idx]},
+		}
+		raw, err := res.Marshal()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		mock.idx++
+		return &coprocessor.BatchResponse{
+			Data: raw,
+		}, nil
+	}
+	return nil, io.EOF
 }
 
 type mockCopStreamErrClient struct {
