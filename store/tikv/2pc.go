@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -204,7 +203,11 @@ func (c *twoPhaseCommitter) extractKeyExistsErr(key kv.Key) error {
 		if handle.IsInt() {
 			return kv.ErrKeyExists.FastGenByArgs(handle.String(), "PRIMARY")
 		}
-		values, err := tablecodec.DecodeValuesBytesToStrings(handle.Encoded())
+		trimLen := 0
+		for i := 0; i < handle.NumCols(); i++ {
+			trimLen += len(handle.EncodedCol(i))
+		}
+		values, err := tablecodec.DecodeValuesBytesToStrings(handle.Encoded()[:trimLen])
 		if err == nil {
 			return kv.ErrKeyExists.FastGenByArgs(strings.Join(values, "-"), "PRIMARY")
 		}
@@ -223,91 +226,67 @@ func (c *twoPhaseCommitter) initKeysAndMutations() error {
 
 	txn := c.txn
 	memBuf := txn.GetMemBuffer()
-	sizeHint := len(txn.lockKeys) + txn.us.GetMemBuffer().Len()
+	sizeHint := txn.us.GetMemBuffer().Len()
 	mutations := NewCommiterMutations(sizeHint)
 	c.isPessimistic = txn.IsPessimistic()
 
-	// Merge ordered lockKeys and pairs in the memBuffer into the mutations array
-	sort.Slice(txn.lockKeys, func(i, j int) bool {
-		return bytes.Compare(txn.lockKeys[i], txn.lockKeys[j]) < 0
-	})
-	lockIdx := 0
-	err := kv.WalkMemBuffer(txn.us.GetMemBuffer(), func(k kv.Key, v []byte) error {
-		var (
-			op                pb.Op
-			value             []byte
-			isPessimisticLock bool
-		)
-		if len(v) > 0 {
-			if tablecodec.IsUntouchedIndexKValue(k, v) {
-				return nil
+	var err error
+	for it := memBuf.IterWithFlags(nil, nil); it.Valid(); err = it.Next() {
+		_ = err
+		key := it.Key()
+		flags := it.Flags()
+		var value []byte
+		var op pb.Op
+
+		if !it.HasValue() {
+			if !flags.HasLocked() {
+				continue
 			}
-			op = pb.Op_Put
-			if txn.us.HasPresumeKeyNotExists(k) {
-				op = pb.Op_Insert
-			}
-			value = v
-			putCnt++
+			op = pb.Op_Lock
+			lockCnt++
 		} else {
-			if !txn.IsPessimistic() && txn.us.HasPresumeKeyNotExists(k) {
-				// delete-your-writes keys in optimistic txn need check not exists in prewrite-phase
-				// due to `Op_CheckNotExists` doesn't prewrite lock, so mark those keys should not be used in commit-phase.
-				op = pb.Op_CheckNotExists
-				checkCnt++
-				memBuf.UpdateFlags(k, kv.SetNoNeedCommit)
+			value = it.Value()
+			if len(value) > 0 {
+				if tablecodec.IsUntouchedIndexKValue(key, value) {
+					continue
+				}
+				op = pb.Op_Put
+				if flags.HasPresumeKeyNotExists() {
+					op = pb.Op_Insert
+				}
+				putCnt++
 			} else {
-				// normal delete keys in optimistic txn can be delete without not exists checking
-				// delete-your-writes keys in pessimistic txn can ensure must be no exists so can directly delete them
-				op = pb.Op_Del
-				delCnt++
+				if !txn.IsPessimistic() && flags.HasPresumeKeyNotExists() {
+					// delete-your-writes keys in optimistic txn need check not exists in prewrite-phase
+					// due to `Op_CheckNotExists` doesn't prewrite lock, so mark those keys should not be used in commit-phase.
+					op = pb.Op_CheckNotExists
+					checkCnt++
+					memBuf.UpdateFlags(key, kv.SetNoNeedCommit)
+				} else {
+					// normal delete keys in optimistic txn can be delete without not exists checking
+					// delete-your-writes keys in pessimistic txn can ensure must be no exists so can directly delete them
+					op = pb.Op_Del
+					delCnt++
+				}
 			}
 		}
-		for lockIdx < len(txn.lockKeys) {
-			lockKey := txn.lockKeys[lockIdx]
-			ord := bytes.Compare(lockKey, k)
-			if ord == 0 {
-				isPessimisticLock = c.isPessimistic
-				lockIdx++
-				break
-			} else if ord > 0 {
-				break
-			} else {
-				mutations.Push(pb.Op_Lock, lockKey, nil, c.isPessimistic)
-				lockCnt++
-				size += len(lockKey)
-				lockIdx++
-			}
+
+		var isPessimistic bool
+		if flags.HasLocked() {
+			isPessimistic = c.isPessimistic
 		}
-		mutations.Push(op, k, value, isPessimisticLock)
-		entrySize := len(k) + len(v)
-		if uint64(entrySize) > kv.TxnEntrySizeLimit {
-			return kv.ErrEntryTooLarge.GenWithStackByArgs(kv.TxnEntrySizeLimit, entrySize)
+		mutations.Push(op, key, value, isPessimistic)
+		size += len(key) + len(value)
+
+		if len(c.primaryKey) == 0 && op != pb.Op_CheckNotExists {
+			c.primaryKey = key
 		}
-		size += entrySize
-		return nil
-	})
-	if err != nil {
-		return errors.Trace(err)
 	}
-	// add the remaining locks to mutations and keys
-	for _, lockKey := range txn.lockKeys[lockIdx:] {
-		mutations.Push(pb.Op_Lock, lockKey, nil, c.isPessimistic)
-		lockCnt++
-		size += len(lockKey)
-	}
+
 	if mutations.len() == 0 {
 		return nil
 	}
 	c.txnSize = size
-
-	if len(c.primaryKey) == 0 {
-		for i, op := range mutations.ops {
-			if op != pb.Op_CheckNotExists {
-				c.primaryKey = mutations.keys[i]
-				break
-			}
-		}
-	}
 
 	if size > int(kv.TxnTotalSizeLimit) {
 		return kv.ErrTxnTooLarge.GenWithStackByArgs(size)
@@ -451,7 +430,9 @@ func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *Backoffer, action twoPh
 	action.tiKVTxnRegionsNumHistogram().Observe(float64(len(groups)))
 
 	var sizeFunc = c.keySize
-	if _, ok := action.(actionPrewrite); ok {
+
+	switch act := action.(type) {
+	case actionPrewrite:
 		// Do not update regionTxnSize on retries. They are not used when building a PrewriteRequest.
 		if len(bo.errors) == 0 {
 			for _, group := range groups {
@@ -460,6 +441,10 @@ func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *Backoffer, action twoPh
 		}
 		sizeFunc = c.keyValueSize
 		atomic.AddInt32(&c.getDetail().PrewriteRegionNum, int32(len(groups)))
+	case actionPessimisticLock:
+		if act.LockCtx.Stats != nil {
+			act.LockCtx.Stats.RegionNum = int32(len(groups))
+		}
 	}
 
 	batchBuilder := newBatched(c.primary())
@@ -838,7 +823,7 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 		logutil.SetTag(ctx, "commitTs", commitTS)
 	}
 
-	tryAmend := c.isPessimistic && c.connID > 0 && !c.isAsyncCommit()
+	tryAmend := c.isPessimistic && c.connID > 0 && !c.isAsyncCommit() && c.txn.schemaAmender != nil
 	if !tryAmend {
 		_, _, err = c.checkSchemaValid(ctx, commitTS, c.txn.txnInfoSchema, false)
 		if err != nil {
@@ -1028,8 +1013,12 @@ func (c *twoPhaseCommitter) checkSchemaValid(ctx context.Context, checkTS uint64
 	tryAmend bool) (*RelatedSchemaChange, bool, error) {
 	checker, ok := c.txn.us.GetOption(kv.SchemaChecker).(schemaLeaseChecker)
 	if !ok {
-		logutil.Logger(ctx).Warn("schemaLeaseChecker is not set for this transaction, schema check skipped",
-			zap.Uint64("connID", c.connID), zap.Uint64("startTS", c.startTS), zap.Uint64("commitTS", checkTS))
+		if c.connID > 0 {
+			logutil.Logger(ctx).Warn("schemaLeaseChecker is not set for this transaction",
+				zap.Uint64("connID", c.connID),
+				zap.Uint64("startTS", c.startTS),
+				zap.Uint64("commitTS", checkTS))
+		}
 		return nil, false, nil
 	}
 	relatedChanges, err := checker.CheckBySchemaVer(checkTS, startInfoSchema)
