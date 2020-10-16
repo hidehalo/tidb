@@ -147,7 +147,7 @@ func newBaseBuiltinFuncWithTp(ctx sessionctx.Context, funcName string, args []Ex
 	if ctx == nil {
 		return baseBuiltinFunc{}, errors.New("unexpected nil session ctx")
 	}
-
+	// FIXME: Precision lost of float point value cast
 	for i := range args {
 		switch argTps[i] {
 		case types.ETInt:

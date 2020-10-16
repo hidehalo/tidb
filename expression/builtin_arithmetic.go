@@ -457,6 +457,7 @@ func (s *builtinArithmeticMinusIntSig) evalInt(row chunk.Row) (val int64, isNull
 	return a - b, false, nil
 }
 
+// fucking here
 type arithmeticMultiplyFunctionClass struct {
 	baseFunctionClass
 }
@@ -467,11 +468,16 @@ func (c *arithmeticMultiplyFunctionClass) getFunction(ctx sessionctx.Context, ar
 	}
 	lhsTp, rhsTp := args[0].GetType(), args[1].GetType()
 	lhsEvalTp, rhsEvalTp := numericContextResultType(lhsTp), numericContextResultType(rhsTp)
+	fmt.Println("arithmeticMultiplyFunctionClass#getFunction")
+	fmt.Println("Left expr tp=", lhsTp, "right expr tp=", rhsEvalTp)
+	fmt.Println("Left expor node eval tp=", lhsEvalTp, "right expor node eval tp=", rhsEvalTp)
 	if lhsEvalTp == types.ETReal || rhsEvalTp == types.ETReal {
 		bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETReal, types.ETReal, types.ETReal)
 		if err != nil {
 			return nil, err
 		}
+		fmt.Println("BuiltinFunc=", bf.args)
+
 		setFlenDecimal4RealOrDecimal(bf.tp, args[0].GetType(), args[1].GetType(), true, true)
 		sig := &builtinArithmeticMultiplyRealSig{bf}
 		sig.setPbCode(tipb.ScalarFuncSig_MultiplyReal)

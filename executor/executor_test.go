@@ -6588,3 +6588,13 @@ func (s *testSerialSuite) TestIssue19148(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(int(tblInfo.Meta().Columns[0].Flag), Equals, 0)
 }
+
+func (s *testSuite) TestIssue15884(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustQuery("select '971580' * (5/6);").Check(testkit.Rows(
+		"809650",
+	))
+	tk.MustQuery("select 971580 * (5/6);").Check(testkit.Rows(
+		"809650",
+	))
+}
