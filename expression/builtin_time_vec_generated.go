@@ -1645,8 +1645,44 @@ func (b *builtinAddDateStringStringSig) vectorized() bool {
 }
 
 func (b *builtinAddDateStringIntSig) vecEvalTime(input *chunk.Chunk, result *chunk.Column) error {
-	for i := 0; i < input.NumRows(); i++ {
-		result.AppendNull()
+	n := input.NumRows()
+	unit, isNull, err := b.args[2].EvalString(b.ctx, chunk.Row{})
+	if err != nil {
+		return err
+	}
+	if isNull {
+		result.ResizeTime(n, true)
+		return nil
+	}
+
+	intervalBuf, err := b.bufAllocator.get(types.ETString, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(intervalBuf)
+	if err := b.vecGetIntervalFromInt(&b.baseBuiltinFunc, input, unit, intervalBuf); err != nil {
+		return err
+	}
+
+	if err := b.vecGetDateFromString(&b.baseBuiltinFunc, input, unit, result); err != nil {
+		return err
+	}
+
+	result.MergeNulls(intervalBuf)
+	resDates := result.Times()
+	for i := 0; i < n; i++ {
+		if result.IsNull(i) {
+			continue
+		}
+		resDate, isNull, err := b.add(b.ctx, resDates[i], intervalBuf.GetString(i), unit)
+		if err != nil {
+			return err
+		}
+		if isNull {
+			result.SetNull(i, true)
+		} else {
+			resDates[i] = resDate
+		}
 	}
 	return nil
 }
