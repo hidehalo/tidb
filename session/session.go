@@ -2209,6 +2209,7 @@ var builtinGlobalVariable = []string{
 	variable.InnodbLockWaitTimeout,
 	variable.WindowingUseHighPrecision,
 	variable.SQLSelectLimit,
+	variable.DefaultWeekFormat,
 
 	/* TiDB specific global variables: */
 	variable.TiDBSkipASCIICheck,
@@ -2282,7 +2283,10 @@ var builtinGlobalVariable = []string{
 	variable.TiDBEnableTelemetry,
 	variable.TiDBShardAllocateStep,
 	variable.TiDBEnableChangeColumnType,
+	variable.TiDBEnableChangeMultiSchema,
 	variable.TiDBEnableAmendPessimisticTxn,
+	variable.TiDBMemQuotaApplyCache,
+	variable.TiDBEnableParallelApply,
 	variable.TiDBMemoryUsageAlarmRatio,
 	variable.TiDBEnableRateLimitAction,
 	variable.TiDBEnableAsyncCommit,
