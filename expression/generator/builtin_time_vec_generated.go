@@ -16,7 +16,6 @@
 package expression
 
 import (
-	"fmt"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/types"
@@ -24,7 +23,6 @@ import (
 )
 
 func (b *builtinAddDatetimeAndDurationSig) vecEvalTime(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("run builtinAddDatetimeAndDurationSig#vecEvalTime")
 	n := input.NumRows()
 
 	if err := b.args[0].VecEvalTime(b.ctx, input, result); err != nil {
@@ -82,7 +80,6 @@ func (b *builtinAddDatetimeAndDurationSig) vectorized() bool {
 }
 
 func (b *builtinAddDatetimeAndStringSig) vecEvalTime(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("run builtinAddDatetimeAndStringSig#vecEvalTime")
 	n := input.NumRows()
 
 	if err := b.args[0].VecEvalTime(b.ctx, input, result); err != nil {
@@ -153,7 +150,6 @@ func (b *builtinAddDatetimeAndStringSig) vectorized() bool {
 }
 
 func (b *builtinAddDurationAndDurationSig) vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddDurationAndDurationSig#vecEvalDuration")
 	n := input.NumRows()
 
 	if err := b.args[0].VecEvalDuration(b.ctx, input, result); err != nil {
@@ -210,7 +206,6 @@ func (b *builtinAddDurationAndDurationSig) vectorized() bool {
 }
 
 func (b *builtinAddDurationAndStringSig) vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddDurationAndStringSig#vecEvalDuration")
 	n := input.NumRows()
 
 	if err := b.args[0].VecEvalDuration(b.ctx, input, result); err != nil {
@@ -280,7 +275,6 @@ func (b *builtinAddDurationAndStringSig) vectorized() bool {
 }
 
 func (b *builtinAddStringAndDurationSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddStringAndDurationSig#vecEvalString")
 	n := input.NumRows()
 
 	buf0, err := b.bufAllocator.get(types.ETString, n)
@@ -358,7 +352,6 @@ func (b *builtinAddStringAndDurationSig) vectorized() bool {
 }
 
 func (b *builtinAddStringAndStringSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddStringAndStringSig#vecEvalString")
 	n := input.NumRows()
 
 	buf0, err := b.bufAllocator.get(types.ETString, n)
@@ -451,7 +444,6 @@ func (b *builtinAddStringAndStringSig) vectorized() bool {
 }
 
 func (b *builtinAddDateAndDurationSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddDateAndDurationSig#vecEvalString")
 	n := input.NumRows()
 
 	buf0, err := b.bufAllocator.get(types.ETDuration, n)
@@ -517,7 +509,6 @@ func (b *builtinAddDateAndDurationSig) vectorized() bool {
 }
 
 func (b *builtinAddDateAndStringSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddDateAndStringSig#vecEvalString")
 	n := input.NumRows()
 
 	buf0, err := b.bufAllocator.get(types.ETDuration, n)
@@ -594,7 +585,6 @@ func (b *builtinAddDateAndStringSig) vectorized() bool {
 }
 
 func (b *builtinAddTimeDateTimeNullSig) vecEvalTime(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddTimeDateTimeNullSig#vecEvalTime")
 	n := input.NumRows()
 
 	result.ResizeTime(n, true)
@@ -607,7 +597,6 @@ func (b *builtinAddTimeDateTimeNullSig) vectorized() bool {
 }
 
 func (b *builtinAddTimeStringNullSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddTimeStringNullSig#vecEvalString")
 	n := input.NumRows()
 
 	result.ReserveString(n)
@@ -623,7 +612,6 @@ func (b *builtinAddTimeStringNullSig) vectorized() bool {
 }
 
 func (b *builtinAddTimeDurationNullSig) vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error {
-	fmt.Println("builtinAddTimeDurationNullSig#vecEvalDuration")
 	n := input.NumRows()
 
 	result.ResizeGoDuration(n, true)
