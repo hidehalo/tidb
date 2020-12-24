@@ -405,8 +405,8 @@ func (b *builtinAddStringAndStringSig) vecEvalString(input *chunk.Chunk, result 
 		// calculate
 
 		sc := b.ctx.GetSessionVars().StmtCtx
-		_, err = types.ParseDatetime(sc, arg1)
-		if err == nil {
+		arg1Time, _ := types.ParseDatetime(sc, arg1)
+		if arg1Time.Month() > 0 {
 			result.AppendNull() // fixed: false
 			continue
 		}
