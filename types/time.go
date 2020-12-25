@@ -1642,6 +1642,7 @@ func matchFrac(str string, fsp int8) (bool, int, string, error) {
 }
 
 func matchDuration(str string, fsp int8) (Duration, error) {
+	// CONFUSE: why here doesn't check is str a legal time string?
 	fsp, err := CheckFsp(int(fsp))
 	if err != nil {
 		return ZeroDuration, errors.Trace(err)
