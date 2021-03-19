@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ import (
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/plancodec"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // ParseSlowLogBatchSize is the batch size of slow-log lines for a worker to parse, exported for testing.
@@ -58,12 +60,11 @@ type slowQueryRetriever struct {
 	initialized bool
 	extractor   *plannercore.SlowQueryExtractor
 	files       []logFile
-	fileIdx     int
-	fileLine    int
 	checker     *slowLogChecker
 
 	taskList chan slowLogTask
 	stats    *slowQueryRuntimeStats
+	errCh    chan error
 }
 
 func (e *slowQueryRetriever) retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error) {
@@ -74,12 +75,9 @@ func (e *slowQueryRetriever) retrieve(ctx context.Context, sctx sessionctx.Conte
 		}
 		e.initializeAsyncParsing(ctx, sctx)
 	}
-	rows, retrieved, err := e.dataForSlowLog(ctx)
+	rows, err := e.dataForSlowLog(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if retrieved {
-		return nil, nil
 	}
 	if len(e.outputCols) == len(e.table.Columns) {
 		return rows, nil
@@ -120,6 +118,7 @@ func (e *slowQueryRetriever) initialize(ctx context.Context, sctx sessionctx.Con
 	} else {
 		e.extractor = &plannercore.SlowQueryExtractor{}
 	}
+	e.errCh = make(chan error)
 	e.initialized = true
 	e.files, err = e.getAllFiles(ctx, sctx, sctx.GetSessionVars().SlowQueryFile)
 	if e.extractor.Desc {
@@ -132,6 +131,7 @@ func (e *slowQueryRetriever) reverseLogFiles() {
 	for i := 0; i < len(e.files)/2; i++ {
 		j := len(e.files) - i - 1
 		e.files[i], e.files[j] = e.files[j], e.files[i]
+		e.files[i].order, e.files[j].order = e.files[j].order, e.files[i].order
 	}
 }
 
@@ -145,82 +145,97 @@ func (e *slowQueryRetriever) close() error {
 	return nil
 }
 
-type parsedSlowLog struct {
-	rows [][]types.Datum
-	err  error
+func (e *slowQueryRetriever) parseDataForSlowLog(ctx context.Context, sctx sessionctx.Context) error {
+	defer close(e.taskList)
+	var eg errgroup.Group
+	concurrency := runtime.NumCPU() - 1
+	if concurrency > len(e.files) {
+		concurrency = len(e.files)
+	}
+	// parse multiple files concurrently
+	logFileCh := make(chan *logFile, concurrency)
+	var lock sync.Mutex
+	for c := 0; c < concurrency; c++ {
+		eg.Go(func() error {
+			var reader *bufio.Reader
+			var localReadFileSize int64
+			var localReadFileNum int
+			defer func() {
+				if e.stats != nil {
+					lock.Lock()
+					e.stats.readFileSize += localReadFileSize
+					e.stats.readFileNum += localReadFileNum
+					lock.Unlock()
+				}
+			}()
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case logFile := <-logFileCh:
+					if logFile == nil {
+						return nil
+					}
+					if reader == nil {
+						reader = bufio.NewReader(logFile.file)
+					} else {
+						reader.Reset(logFile.file)
+					}
+					err := e.parseSlowLog(ctx, sctx, logFile, reader, ParseSlowLogBatchSize)
+					if err != nil {
+						return err
+					}
+					if e.stats != nil {
+						stat, err := logFile.file.Stat()
+						if err == nil {
+							// ignore the err will be ok.
+							localReadFileSize += stat.Size()
+							localReadFileNum++
+						}
+					}
+				}
+			}
+		})
+	}
+	for i := range e.files {
+		logFileCh <- &e.files[i]
+	}
+	close(logFileCh)
+	return eg.Wait()
 }
 
-func (e *slowQueryRetriever) getNextFile() *os.File {
-	if e.fileIdx >= len(e.files) {
-		return nil
-	}
-	file := e.files[e.fileIdx].file
-	e.fileIdx++
-	if e.stats != nil {
-		stat, err := file.Stat()
-		if err == nil {
-			// ignore the err will be ok.
-			e.stats.readFileSize += stat.Size()
-			e.stats.readFileNum++
-		}
-	}
-	return file
-}
-
-func (e *slowQueryRetriever) getPreviousFile() *os.File {
-	fileIdx := e.fileIdx
-	// fileIdx refer to the next file which should be read
-	// so we need to set fileIdx to fileIdx - 2 to get the previous file.
-	fileIdx = fileIdx - 2
-	if fileIdx < 0 {
-		return nil
-	}
-	file := e.files[fileIdx].file
-	_, err := file.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil
-	}
-	return file
-}
-
-func (e *slowQueryRetriever) parseDataForSlowLog(ctx context.Context, sctx sessionctx.Context) {
-	file := e.getNextFile()
-	if file == nil {
-		close(e.taskList)
-		return
-	}
-	reader := bufio.NewReader(file)
-	e.parseSlowLog(ctx, sctx, reader, ParseSlowLogBatchSize)
-}
-
-func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datum, bool, error) {
+func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datum, error) {
 	var (
-		task slowLogTask
-		ok   bool
+		task           slowLogTask
+		taskCollection slowLogTaskCollection
+		active         bool
+		rows           [][]types.Datum
 	)
 	for {
 		select {
-		case task, ok = <-e.taskList:
 		case <-ctx.Done():
-			return nil, false, ctx.Err()
+			return nil, ctx.Err()
+		case err := <-e.errCh:
+			return nil, err
+		case task, active = <-e.taskList:
 		}
-		if !ok {
-			return nil, true, nil
+		if !active {
+			break
 		}
-		result := <-task.resultCh
-		rows, err := result.rows, result.err
-		if err != nil {
-			return nil, false, err
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		if e.table.Name.L == strings.ToLower(infoschema.ClusterTableSlowLog) {
-			rows, err := infoschema.AppendHostInfoToRows(rows)
-			return rows, false, err
-		}
-		return rows, false, nil
+		taskCollection = append(taskCollection, task)
 	}
+	sort.Sort(taskCollection)
+	for _, task := range taskCollection {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case err := <-e.errCh:
+			return nil, err
+		case tmpRows := <-task.parsedRowsCh:
+			rows = append(rows, tmpRows...)
+		}
+	}
+	return rows, nil
 }
 
 type slowLogChecker struct {
@@ -280,18 +295,29 @@ func getOneLine(reader *bufio.Reader) ([]byte, error) {
 	return resByte, err
 }
 
-type offset struct {
-	offset int
-	length int
+type slowLogTask struct {
+	logFileOrder int // order of log files
+	offset       int // offset (line) of log file
+	parsedRowsCh chan [][]types.Datum
 }
 
-type slowLogTask struct {
-	resultCh chan parsedSlowLog
+type slowLogTaskCollection []slowLogTask
+
+func (c slowLogTaskCollection) Len() int {
+	return len(c)
+}
+
+func (c slowLogTaskCollection) Less(i, j int) bool {
+	return c[i].logFileOrder < c[j].logFileOrder && c[i].offset < c[j].offset
+}
+
+func (c slowLogTaskCollection) Swap(i, j int) {
+	c[i], c[j] = c[j], c[i]
 }
 
 type slowLogBlock []string
 
-func (e *slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Reader, offset *offset, num int) ([][]string, error) {
+func (e *slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Reader, num int) ([][]string, error) {
 	var line string
 	log := make([]string, 0, num)
 	var err error
@@ -300,27 +326,17 @@ func (e *slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Read
 			if isCtxDone(ctx) {
 				return nil, ctx.Err()
 			}
-			e.fileLine++
 			lineByte, err := getOneLine(reader)
-			if err != nil {
-				if err == io.EOF {
-					e.fileLine = 0
-					file := e.getNextFile()
-					if file == nil {
-						return [][]string{log}, nil
-					}
-					offset.length = len(log)
-					reader.Reset(file)
-					continue
-				}
+			if err == io.EOF {
+				return [][]string{log}, nil
+			} else if err != nil {
 				return [][]string{log}, err
 			}
 			line = string(hack.String(lineByte))
 			log = append(log, line)
-			if strings.HasSuffix(line, variable.SlowLogSQLSuffixStr) {
-				if strings.HasPrefix(line, "use") || strings.HasPrefix(line, variable.SlowLogRowPrefixStr) {
-					continue
-				}
+			if strings.HasSuffix(line, variable.SlowLogSQLSuffixStr) &&
+				!strings.HasPrefix(line, "use") &&
+				!strings.HasPrefix(line, variable.SlowLogRowPrefixStr) {
 				break
 			}
 		}
@@ -328,15 +344,7 @@ func (e *slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Read
 	return [][]string{log}, err
 }
 
-func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, reader *bufio.Reader, offset *offset, num int) ([][]string, error) {
-	// reader maybe change when read previous file.
-	inputReader := reader
-	defer func() {
-		file := e.getNextFile()
-		if file != nil {
-			inputReader.Reset(file)
-		}
-	}()
+func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, reader *bufio.Reader, num int) ([][]string, error) {
 	var line string
 	var logs []slowLogBlock
 	var log []string
@@ -347,24 +355,14 @@ func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, rea
 		if isCtxDone(ctx) {
 			return nil, ctx.Err()
 		}
-		e.fileLine++
 		lineByte, err := getOneLine(reader)
-		if err != nil {
-			if err == io.EOF {
-				if len(log) == 0 {
-					decomposedSlowLogTasks := decomposeToSlowLogTasks(logs, num)
-					offset.length = len(decomposedSlowLogTasks)
-					return decomposedSlowLogTasks, nil
-				}
-				e.fileLine = 0
-				file := e.getPreviousFile()
-				if file == nil {
-					return decomposeToSlowLogTasks(logs, num), nil
-				}
-				reader = bufio.NewReader(file)
-				scanPreviousFile = true
-				continue
+		if err == io.EOF {
+			if len(log) == 0 {
+				decomposedSlowLogTasks := decomposeToSlowLogTasks(logs, num)
+				return decomposedSlowLogTasks, nil
 			}
+			return decomposeToSlowLogTasks(logs, num), nil
+		} else if err != nil {
 			return nil, err
 		}
 		line = string(hack.String(lineByte))
@@ -415,83 +413,101 @@ func decomposeToSlowLogTasks(logs []slowLogBlock, num int) [][]string {
 	return decomposedSlowLogTasks
 }
 
-func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.Context, reader *bufio.Reader, logNum int) {
-	defer close(e.taskList)
-	var wg sync.WaitGroup
-	offset := offset{offset: 0, length: 0}
+type unparsedLog struct {
+	rawLogs [][]string
+	task    slowLogTask
+}
+
+func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.Context, logFile *logFile, reader *bufio.Reader, batchSize int) error {
 	// To limit the num of go routine
-	concurrent := sctx.GetSessionVars().Concurrency.DistSQLScanConcurrency()
-	ch := make(chan int, concurrent)
+	concurrent := cap(e.taskList)
 	if e.stats != nil {
 		e.stats.concurrent = concurrent
 	}
-	defer close(ch)
+	unparsedLogCh := make(chan unparsedLog, concurrent)
+	eg, childCtx := errgroup.WithContext(ctx)
+	// start multiple slow log parser's go-routines
+	for c := 0; c < concurrent; c++ {
+		eg.Go(func() error {
+			for {
+				select {
+				case <-childCtx.Done():
+					return childCtx.Err()
+				case unparsedLog, active := <-unparsedLogCh:
+					if !active {
+						return nil
+					}
+					e.taskList <- unparsedLog.task
+					rows := make([][]types.Datum, 0, ParseSlowLogBatchSize)
+					for _, log := range unparsedLog.rawLogs {
+						result, err := e.parseLog(ctx, sctx, log)
+						if e.table.Name.L == strings.ToLower(infoschema.ClusterTableSlowLog) {
+							result, err = infoschema.AppendHostInfoToRows(result)
+						}
+						if err != nil {
+							e.sendParsedSlowLogCh(ctx, unparsedLog.task, rows)
+							return err
+						}
+						rows = append(rows, result...)
+					}
+					e.sendParsedSlowLogCh(ctx, unparsedLog.task, rows)
+				}
+			}
+		})
+	}
+	var lock sync.Mutex
+	var localReadFile time.Duration
+	if e.stats != nil {
+		lock.Lock()
+		e.stats.readFile += localReadFile
+		lock.Unlock()
+	}
+	var offset int
+	var err error
+	// retrieve unparsed logs from a slow query log file & send to parser
 	for {
 		startTime := time.Now()
 		var logs [][]string
-		var err error
 		if !e.extractor.Desc {
-			logs, err = e.getBatchLog(ctx, reader, &offset, logNum)
+			logs, err = e.getBatchLog(ctx, reader, batchSize)
 		} else {
-			logs, err = e.getBatchLogForReversedScan(ctx, reader, &offset, logNum)
+			logs, err = e.getBatchLogForReversedScan(ctx, reader, batchSize)
+		}
+		if e.stats != nil {
+			localReadFile += time.Since(startTime)
 		}
 		if err != nil {
-			t := slowLogTask{}
-			t.resultCh = make(chan parsedSlowLog, 1)
-			e.taskList <- t
-			e.sendParsedSlowLogCh(ctx, t, parsedSlowLog{nil, err})
+			break
 		}
 		if len(logs) == 0 || len(logs[0]) == 0 {
 			break
 		}
-		if e.stats != nil {
-			e.stats.readFile += time.Since(startTime)
+		unparsedLogCh <- unparsedLog{
+			rawLogs: logs,
+			task: slowLogTask{
+				logFileOrder: logFile.order,
+				offset:       offset,
+				parsedRowsCh: make(chan [][]types.Datum, 1),
+			},
 		}
-		for i := range logs {
-			log := logs[i]
-			t := slowLogTask{}
-			t.resultCh = make(chan parsedSlowLog, 1)
-			start := offset
-			wg.Add(1)
-			ch <- 1
-			e.taskList <- t
-			go func() {
-				defer wg.Done()
-				result, err := e.parseLog(ctx, sctx, log, start)
-				e.sendParsedSlowLogCh(ctx, t, parsedSlowLog{result, err})
-				<-ch
-			}()
-			offset.offset = e.fileLine
-			offset.length = 0
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-		}
+		offset += len(logs)
 	}
-	wg.Wait()
+	close(unparsedLogCh)
+	if err != nil {
+		eg.Wait()
+		return err
+	}
+	return eg.Wait()
 }
 
-func (e *slowQueryRetriever) sendParsedSlowLogCh(ctx context.Context, t slowLogTask, re parsedSlowLog) {
+func (e *slowQueryRetriever) sendParsedSlowLogCh(ctx context.Context, t slowLogTask, parsedRows [][]types.Datum) {
 	select {
-	case t.resultCh <- re:
 	case <-ctx.Done():
-		return
+	case t.parsedRowsCh <- parsedRows:
 	}
 }
 
-func getLineIndex(offset offset, index int) int {
-	var fileLine int
-	if offset.length <= index {
-		fileLine = index - offset.length + 1
-	} else {
-		fileLine = offset.offset + index + 1
-	}
-	return fileLine
-}
-
-func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Context, log []string, offset offset) (data [][]types.Datum, err error) {
+func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Context, log []string) (data [][]types.Datum, err error) {
 	start := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
@@ -513,10 +529,9 @@ func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Conte
 		if isCtxDone(ctx) {
 			return nil, ctx.Err()
 		}
-		fileLine := getLineIndex(offset, index)
 		if !startFlag && strings.HasPrefix(line, variable.SlowLogStartPrefixStr) {
 			st = &slowQueryTuple{}
-			valid, err := st.setFieldValue(tz, variable.SlowLogTimeStr, line[len(variable.SlowLogStartPrefixStr):], fileLine, e.checker)
+			valid, err := st.setFieldValue(tz, variable.SlowLogTimeStr, line[len(variable.SlowLogStartPrefixStr):], index, e.checker)
 			if err != nil {
 				sctx.GetSessionVars().StmtCtx.AppendWarning(err)
 				continue
@@ -533,7 +548,7 @@ func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Conte
 					st.prevStmt = line[len(variable.SlowLogPrevStmtPrefix):]
 				} else if strings.HasPrefix(line, variable.SlowLogUserAndHostStr+variable.SlowLogSpaceMarkStr) {
 					value := line[len(variable.SlowLogUserAndHostStr+variable.SlowLogSpaceMarkStr):]
-					valid, err := st.setFieldValue(tz, variable.SlowLogUserAndHostStr, value, fileLine, e.checker)
+					valid, err := st.setFieldValue(tz, variable.SlowLogUserAndHostStr, value, index, e.checker)
 					if err != nil {
 						sctx.GetSessionVars().StmtCtx.AppendWarning(err)
 						continue
@@ -542,7 +557,7 @@ func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Conte
 						startFlag = false
 					}
 				} else if strings.HasPrefix(line, variable.SlowLogCopBackoffPrefix) {
-					valid, err := st.setFieldValue(tz, variable.SlowLogBackoffDetail, line, fileLine, e.checker)
+					valid, err := st.setFieldValue(tz, variable.SlowLogBackoffDetail, line, index, e.checker)
 					if err != nil {
 						sctx.GetSessionVars().StmtCtx.AppendWarning(err)
 						continue
@@ -557,7 +572,7 @@ func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Conte
 						if strings.HasSuffix(field, ":") {
 							field = field[:len(field)-1]
 						}
-						valid, err := st.setFieldValue(tz, field, fieldValues[i+1], fileLine, e.checker)
+						valid, err := st.setFieldValue(tz, field, fieldValues[i+1], index, e.checker)
 						if err != nil {
 							sctx.GetSessionVars().StmtCtx.AppendWarning(err)
 							continue
@@ -575,7 +590,7 @@ func (e *slowQueryRetriever) parseLog(ctx context.Context, sctx sessionctx.Conte
 					continue
 				}
 				// Get the sql string, and mark the start flag to false.
-				_, err := st.setFieldValue(tz, variable.SlowLogQuerySQLStr, string(hack.Slice(line)), fileLine, e.checker)
+				_, err := st.setFieldValue(tz, variable.SlowLogQuerySQLStr, string(hack.Slice(line)), index, e.checker)
 				if err != nil {
 					sctx.GetSessionVars().StmtCtx.AppendWarning(err)
 					continue
@@ -964,6 +979,7 @@ func ParseTime(s string) (time.Time, error) {
 type logFile struct {
 	file       *os.File  // The opened file handle
 	start, end time.Time // The start/end time of the log file
+	order      int       // The order of whole slow query log file
 }
 
 // getAllFiles is used to get all slow-log needed to parse, it is exported for test.
@@ -1065,6 +1081,7 @@ func (e *slowQueryRetriever) getAllFiles(ctx context.Context, sctx sessionctx.Co
 			file:  file,
 			start: fileStartTime,
 			end:   fileEndTime,
+			order: len(logFiles),
 		})
 		skip = true
 		return nil
@@ -1250,6 +1267,11 @@ func readLastLines(ctx context.Context, file *os.File, endCursor int64) ([]strin
 }
 
 func (e *slowQueryRetriever) initializeAsyncParsing(ctx context.Context, sctx sessionctx.Context) {
-	e.taskList = make(chan slowLogTask, 100)
-	go e.parseDataForSlowLog(ctx, sctx)
+	e.taskList = make(chan slowLogTask, sctx.GetSessionVars().Concurrency.DistSQLScanConcurrency())
+	go func() {
+		err := e.parseDataForSlowLog(ctx, sctx)
+		if err != nil {
+			e.errCh <- err
+		}
+	}()
 }

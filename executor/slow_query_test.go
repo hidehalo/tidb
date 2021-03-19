@@ -17,13 +17,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/infoschema"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
@@ -32,26 +35,26 @@ import (
 	"github.com/pingcap/tidb/util/mock"
 )
 
-func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, logFile *logFile, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
 	retriever.taskList = make(chan slowLogTask, 100)
 	ctx := context.Background()
-	retriever.parseSlowLog(ctx, sctx, reader, 64)
+	err := retriever.parseSlowLog(ctx, sctx, logFile, reader, 64)
+	if err != nil {
+		return nil, err
+	}
 	task, ok := <-retriever.taskList
 	if !ok {
 		return nil, nil
 	}
-	var rows [][]types.Datum
-	var err error
-	result := <-task.resultCh
-	rows, err = result.rows, result.err
-	return rows, err
+	result := <-task.parsedRowsCh
+	return result, nil
 }
 
-func parseSlowLog(sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+func parseSlowLog(sctx sessionctx.Context, logFile *logFile, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
 	retriever := &slowQueryRetriever{}
 	// Ignore the error is ok for test.
 	terror.Log(retriever.initialize(context.Background(), sctx))
-	rows, err := parseLog(retriever, sctx, reader, logNum)
+	rows, err := parseLog(retriever, sctx, logFile, reader, logNum)
 	return rows, err
 }
 
@@ -85,7 +88,7 @@ select * from t;`
 	c.Assert(err, IsNil)
 	sctx := mock.NewContext()
 	sctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(sctx, reader, 64)
+	_, err = parseSlowLog(sctx, &logFile{}, reader, 64)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "panic test")
 }
@@ -121,7 +124,7 @@ select * from t;`
 	c.Assert(err, IsNil)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	rows, err := parseSlowLog(ctx, reader, 64)
+	rows, err := parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, IsNil)
 	c.Assert(len(rows), Equals, 1)
 	recordString := ""
@@ -144,7 +147,7 @@ select * from t;`
 
 	// Issue 20928
 	reader = bufio.NewReader(bytes.NewBufferString(slowLogStr))
-	rows, err = parseSlowLog(ctx, reader, 1)
+	rows, err = parseSlowLog(ctx, &logFile{}, reader, 1)
 	c.Assert(err, IsNil)
 	c.Assert(len(rows), Equals, 1)
 	recordString = ""
@@ -180,7 +183,7 @@ select a# from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, IsNil)
 
 	// test for time format compatibility.
@@ -191,7 +194,7 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	rows, err = parseSlowLog(ctx, reader, 64)
+	rows, err = parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, IsNil)
 	c.Assert(len(rows) == 2, IsTrue)
 	t0Str, err := rows[0][0].ToString()
@@ -208,7 +211,7 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, IsNil)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(warnings, HasLen, 1)
@@ -232,13 +235,13 @@ select * from t;
 	sql := strings.Repeat("x", int(variable.MaxOfMaxAllowedPacket+1))
 	slowLog.WriteString(sql)
 	reader := bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Equals, "single line length exceeds limit: 65536")
 
 	variable.MaxOfMaxAllowedPacket = originValue
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, reader, 64)
 	c.Assert(err, IsNil)
 }
 
@@ -289,7 +292,7 @@ select * from t;`)
 	c.Assert(err, IsNil)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(ctx, scanner, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, scanner, 64)
 	c.Assert(err, IsNil)
 
 	// Test parser error.
@@ -299,7 +302,7 @@ select * from t;`)
 select * from t;
 `)
 	scanner = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, scanner, 64)
+	_, err = parseSlowLog(ctx, &logFile{}, scanner, 64)
 	c.Assert(err, IsNil)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(warnings, HasLen, 1)
@@ -437,14 +440,25 @@ select 7;`
 			c.Assert(err, IsNil)
 			extractor.TimeRanges = []*plannercore.TimeRange{{StartTime: startTime, EndTime: endTime}}
 		}
-		retriever := &slowQueryRetriever{extractor: extractor}
-		err := retriever.initialize(context.Background(), sctx)
+		tblID := int64(10000)
+		tblName := model.NewCIStr(infoschema.ClusterTableSlowLog)
+		tableInfo := &model.TableInfo{
+			ID:    tblID,
+			Name:  tblName,
+			State: model.StatePublic,
+		}
+		retriever := &slowQueryRetriever{
+			extractor: extractor,
+			table:     tableInfo,
+		}
+		ctx := context.Background()
+		err := retriever.initialize(ctx, sctx)
 		c.Assert(err, IsNil)
 		comment := Commentf("case id: %v", i)
 		c.Assert(retriever.files, HasLen, len(cas.files), comment)
 		if len(retriever.files) > 0 {
-			reader := bufio.NewReader(retriever.files[0].file)
-			rows, err := parseLog(retriever, sctx, reader, 64)
+			retriever.initializeAsyncParsing(ctx, sctx)
+			rows, err := retriever.retrieve(ctx, sctx)
 			c.Assert(err, IsNil)
 			c.Assert(len(rows), Equals, len(cas.querys), comment)
 			for i, row := range rows {
@@ -568,8 +582,8 @@ select 9;`
 		c.Assert(retriever.files, HasLen, len(cas.files), comment)
 		if len(retriever.files) > 0 {
 			reader := bufio.NewReader(retriever.files[0].file)
-			offset := &offset{length: 0, offset: 0}
-			rows, err := retriever.getBatchLogForReversedScan(context.Background(), reader, offset, 3)
+			// offset := &offset{length: 0, offset: 0}
+			rows, err := retriever.getBatchLogForReversedScan(context.Background(), reader, 3)
 			c.Assert(err, IsNil)
 			for _, row := range rows {
 				for j, log := range row {
@@ -599,4 +613,77 @@ func removeFiles(fileNames []string) {
 	for _, fileName := range fileNames {
 		os.Remove(fileName)
 	}
+}
+
+func generateLogs(num int) string {
+	staticTmpl := fmt.Sprintf("# Time: %s\nselect 1;\n", time.Now().Format(time.RFC3339Nano))
+	logs := make([]byte, 0, num*len(staticTmpl))
+	for i := 0; i < num; i++ {
+		logs = append(logs, staticTmpl...)
+	}
+	return string(logs)
+}
+
+func (s *testExecSuite) BenchmarkRetrieveLotsOfSlowLogFiles(c *C) {
+	startTime := time.Now()
+	for i := 0; i < 20; i++ {
+		// "2006-01-02T15-04-05.000" is the `backupTimeFormat` from lumberjack
+		filename := fmt.Sprintf("tidb-slow-%s.log", startTime.Format("2006-01-02T15-04-05.000"))
+		prepareLogs(c, []string{generateLogs(1000)}, []string{filename})
+		defer os.Remove(filename)
+		startTime = startTime.Add(time.Second)
+	}
+	loc, _ := time.LoadLocation("Asia/Shanghai")
+	year, month, day := time.Now().Date()
+	todayTimeRange := &plannercore.TimeRange{
+		StartTime: time.Date(year, month, day, 0, 0, 0, 0, loc),                                   // start of today
+		EndTime:   time.Date(year, month, day, 23, 59, 59, int(time.Second-time.Nanosecond), loc), // end of today
+	}
+	extractor := &plannercore.SlowQueryExtractor{
+		Enable:     true,
+		TimeRanges: []*plannercore.TimeRange{todayTimeRange},
+	}
+	tblID := int64(10000)
+	tblName := model.NewCIStr(infoschema.ClusterTableSlowLog)
+	tableInfo := &model.TableInfo{
+		ID:    tblID,
+		Name:  tblName,
+		State: model.StatePublic,
+	}
+	c.StartTimer()
+	for i := 0; i < c.N; i++ {
+		sctx := mock.NewContext()
+		sctx.GetSessionVars().TimeZone = loc
+		sctx.GetSessionVars().SlowQueryFile = "tidb-slow.log"
+		retriever := &slowQueryRetriever{
+			table:     tableInfo,
+			extractor: extractor,
+		}
+		_, err := retriever.retrieve(context.Background(), sctx)
+		c.Assert(err, IsNil)
+	}
+	c.StopTimer()
+}
+
+func (s *testExecSuite) BenchmarkRetrieveLargeSingleSlowLogFile(c *C) {
+	prepareLogs(c, []string{generateLogs(20000)}, []string{"tidb-slow.log"})
+	defer os.Remove("tidb-slow.log")
+	loc, _ := time.LoadLocation("Asia/Shanghai")
+	tblID := int64(10000)
+	tblName := model.NewCIStr(infoschema.ClusterTableSlowLog)
+	tableInfo := &model.TableInfo{
+		ID:    tblID,
+		Name:  tblName,
+		State: model.StatePublic,
+	}
+	c.StartTimer()
+	for i := 0; i < c.N; i++ {
+		sctx := mock.NewContext()
+		sctx.GetSessionVars().TimeZone = loc
+		sctx.GetSessionVars().SlowQueryFile = "tidb-slow.log"
+		retriever := &slowQueryRetriever{table: tableInfo}
+		_, err := retriever.retrieve(context.Background(), sctx)
+		c.Assert(err, IsNil)
+	}
+	c.StopTimer()
 }
